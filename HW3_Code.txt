@@ -1,0 +1,392 @@
+Computer Intrusion Detection
+Homework Assignment 3 - Detection and Performance Evaluation
+
+Group Members: Iason Mihalopoulos, Steve Nwachukwu, Samantha Ehlers, Debjeet Chakravorty
+
+================================================================================
+TOOLS USED
+================================================================================
+1. Python 3.14.3
+   - Standard library: warnings
+
+2. pandas 3.0.2
+   - Source: https://pandas.pydata.org
+   - Install: pip install pandas
+   - Used for: loading CSV/TXT data, filtering rows, label manipulation, styled display
+
+3. numpy 2.4.4
+   - Source: https://numpy.org
+   - Install: pip install numpy
+   - Used for: array operations, percentile computation, distance statistics, sorting
+
+4. scikit-learn 1.8.0
+   - Source: https://scikit-learn.org
+   - Install: pip install scikit-learn
+   - Classes used:
+       sklearn.preprocessing.MinMaxScaler
+           Parameters: feature_range=(0,1) [default]
+           Fit on: normal training instances only (Part A); full training set (Part B)
+       sklearn.neighbors.NearestNeighbors
+           Parameters: n_neighbors=1, algorithm='ball_tree', metric='euclidean', n_jobs=-1
+           Used for: Part A — distance from each test instance to nearest normal neighbor
+       sklearn.neighbors.KNeighborsClassifier
+           Parameters: n_neighbors=k (k in {1,3,5,7,9,11,13,15,17,19}),
+                       metric='euclidean', n_jobs=-1
+           Used for: Part B binary classification and 5-class classification
+       sklearn.metrics.auc
+           Used for: trapezoidal AUC computation from sorted (FPR, TPR) pairs
+       sklearn.metrics.confusion_matrix
+           Used for: Part B(3) binary confusion matrix per k; Part B(5) 5-class matrix
+
+5. matplotlib 3.10.8
+   - Source: https://matplotlib.org
+   - Install: pip install matplotlib
+   - Used for: Part A ROC curve, Part B ROC curve, Part B confusion matrix heatmap
+
+6. jinja2 3.1.6
+   - Source: https://jinja.palletsprojects.com
+   - Install: pip install jinja2
+   - Used for: styled pandas DataFrame display in Jupyter Notebook
+
+================================================================================
+DATA FILES
+================================================================================
+20 Percent Training Set.csv  — Training data (25,192 records, no header)
+KDDTest+.txt                 — Test data (22,544 records, no header)
+                               Note: KDDTest+.csv from the GitHub repo is malformed
+                               (missing newlines between records) so the .txt
+                               equivalent was used instead.
+
+================================================================================
+OUTPUT FILES
+================================================================================
+part_A_ROC.png               — Part A ROC curve with threshold annotations
+part_B_ROC.png               — Part B ROC curve with k values labeled
+part_B_confusion_matrix.png  — Part B 5-class confusion matrix heatmap
+
+================================================================================
+HOW TO RUN
+================================================================================
+# Install dependencies
+pip install numpy pandas scikit-learn matplotlib jinja2
+
+# Open and run the Jupyter notebook top-to-bottom
+
+================================================================================
+FULL SOURCE CODE
+================================================================================
+
+--- SETUP ---
+
+import sys
+!{sys.executable} -m pip install numpy pandas matplotlib scikit-learn jinja2
+
+--- IMPORTS, CONSTANTS, DATA LOADING ---
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import auc, confusion_matrix
+from sklearn.neighbors import KNeighborsClassifier, NearestNeighbors
+import warnings
+warnings.filterwarnings('ignore')
+%matplotlib inline
+
+COLUMNS = [
+    'duration','protocol_type','service','flag',
+    'src_bytes','dst_bytes','land','wrong_fragment','urgent','hot',
+    'num_failed_logins','logged_in','num_compromised','root_shell',
+    'su_attempted','num_root','num_file_creations','num_shells',
+    'num_access_files','num_outbound_cmds','is_host_login','is_guest_login',
+    'count','srv_count','serror_rate','srv_serror_rate','rerror_rate',
+    'srv_rerror_rate','same_srv_rate','diff_srv_rate','srv_diff_host_rate',
+    'dst_host_count','dst_host_srv_count','dst_host_same_srv_rate',
+    'dst_host_diff_srv_rate','dst_host_same_src_port_rate',
+    'dst_host_srv_diff_host_rate','dst_host_serror_rate',
+    'dst_host_srv_serror_rate','dst_host_rerror_rate',
+    'dst_host_srv_rerror_rate','label','difficulty'
+]
+
+# Three symbolic (nominal/categorical) columns removed for distance calculation
+SYMBOLIC_COLS = ['protocol_type', 'service', 'flag']
+
+# Difficulty is a meta-label not used as a feature
+NUMERIC_COLS = [c for c in COLUMNS if c not in SYMBOLIC_COLS + ['label', 'difficulty']]
+# 38 numeric features remain
+
+# Attack type --> 4-category mapping (source: http://cseweb.ucsd.edu/~elkan/tabulate.html)
+ATTACK_MAP = {
+    'back':'dos','land':'dos','neptune':'dos','pod':'dos','smurf':'dos','teardrop':'dos',
+    'ipsweep':'probe','nmap':'probe','portsweep':'probe','satan':'probe',
+    'ftp_write':'r2l','guess_passwd':'r2l','imap':'r2l','multihop':'r2l',
+    'phf':'r2l','spy':'r2l','warezclient':'r2l','warezmaster':'r2l',
+    'buffer_overflow':'u2r','loadmodule':'u2r','perl':'u2r','rootkit':'u2r',
+    'normal':'normal',
+    'apache2':'dos','mailbomb':'dos','processtable':'dos','udpstorm':'dos',
+    'mscan':'probe','saint':'probe',
+    'httptunnel':'r2l','snmpgetattack':'r2l','snmpguess':'r2l','worm':'r2l',
+    'xsnoop':'r2l','named':'r2l','sendmail':'r2l','xlock':'r2l',
+    'ps':'u2r','sqlattack':'u2r','xterm':'u2r'
+}
+
+def map_attack(label):
+    return ATTACK_MAP.get(label.strip().lower(), 'unknown')
+
+CATEGORIES = ['normal', 'probe', 'dos', 'u2r', 'r2l']
+cat_to_idx = {c: i for i, c in enumerate(CATEGORIES)}
+
+# KDD'99 cost matrix — rows=actual, cols=predicted
+# order: normal, probe, dos, u2r, r2l
+COST_MATRIX = np.array([
+    [0, 1, 2, 2, 2],
+    [1, 0, 2, 2, 2],
+    [2, 1, 0, 2, 2],
+    [3, 2, 2, 0, 2],
+    [4, 2, 2, 2, 0],
+])
+
+cost_matrix_df = pd.DataFrame(COST_MATRIX, index=CATEGORIES, columns=CATEGORIES)
+
+train_df = pd.read_csv('20 Percent Training Set.csv', header=None, names=COLUMNS)
+# KDDTest+.csv on GitHub is malformed (missing newlines), using .txt equivalent
+test_df  = pd.read_csv('KDDTest+.txt', header=None, names=COLUMNS)
+train_df.drop(columns=['difficulty'], inplace=True)
+test_df.drop(columns=['difficulty'],  inplace=True)
+
+X_test_raw    = test_df[NUMERIC_COLS].values
+y_test_binary = (test_df['label'] != 'normal').astype(int).values
+
+print(f"Training: {len(train_df):,} records | Test: {len(test_df):,} records")
+print(f"Numeric features used: {len(NUMERIC_COLS)}")
+print("\nCost Matrix:")
+display(cost_matrix_df)
+
+================================================================================
+PART A: ANOMALY DETECTION
+================================================================================
+
+--- A(1): Extract normal instances; normalize ---
+
+train_normal       = train_df[train_df['label'] == 'normal']
+X_train_normal_raw = train_normal[NUMERIC_COLS].values
+
+scaler_A       = MinMaxScaler()
+X_train_normal = scaler_A.fit_transform(X_train_normal_raw)
+X_test_A       = scaler_A.transform(X_test_raw)
+
+print(f"Normal training instances : {len(train_normal):,}")
+print(f"Scaler range per feature  : [0, 1]  (Min-Max normalization)")
+
+--- A(2): Find nearest normal neighbor; compute anomaly score ---
+
+nn_model = NearestNeighbors(n_neighbors=1, algorithm='ball_tree', metric='euclidean', n_jobs=-1)
+nn_model.fit(X_train_normal)
+distances, _           = nn_model.kneighbors(X_test_A)
+dist_to_nearest_normal = distances[:, 0]
+
+pd.Series(dist_to_nearest_normal).describe().rename('Distance to Nearest Normal Neighbor')
+
+--- A(3): Vary threshold; classify each instance as normal or attack ---
+
+percentiles    = [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 99]
+raw_thresholds = np.percentile(dist_to_nearest_normal, percentiles)
+
+rows = []
+for p, t in zip(percentiles, raw_thresholds):
+    y_pred = (dist_to_nearest_normal > t).astype(int)
+    tp = np.sum((y_pred==1) & (y_test_binary==1))
+    fp = np.sum((y_pred==1) & (y_test_binary==0))
+    tn = np.sum((y_pred==0) & (y_test_binary==0))
+    fn = np.sum((y_pred==0) & (y_test_binary==1))
+    rows.append({
+        'Percentile': p,
+        'Threshold': round(t, 4),
+        'Predicted Attack (>t)': int(tp+fp),
+        'Predicted Normal (<=t)': int(tn+fn),
+        'TP': tp, 'FP': fp, 'TN': tn, 'FN': fn
+    })
+
+thresh_df = pd.DataFrame(rows)
+thresh_df.style.format({'Threshold': '{:.4f}', 'Percentile': '{:.0f}'})
+
+--- A(4): Calculate FPR & TPR; plot ROC curve ---
+
+thresh_df['TPR'] = thresh_df['TP'] / (thresh_df['TP'] + thresh_df['FN'])
+thresh_df['FPR'] = thresh_df['FP'] / (thresh_df['FP'] + thresh_df['TN'])
+
+display(thresh_df[['Threshold','TP','FP','TN','FN','FPR','TPR']].style.format({
+    'Threshold': '{:.4f}', 'FPR': '{:.4f}', 'TPR': '{:.4f}'
+}))
+
+fpr_A = thresh_df['FPR'].tolist()
+tpr_A = thresh_df['TPR'].tolist()
+order      = np.argsort(fpr_A)
+fpr_A_plot = [0.0] + [fpr_A[i] for i in order] + [1.0]
+tpr_A_plot = [0.0] + [tpr_A[i] for i in order] + [1.0]
+
+plt.figure(figsize=(7,6))
+plt.plot(fpr_A_plot, tpr_A_plot, 'b-o', markersize=6, label='ROC Curve')
+plt.plot([0,1],[0,1],'k--', alpha=0.5, label='Random classifier')
+for _, r in thresh_df.iterrows():
+    plt.annotate(f'{r.Threshold}', (r.FPR, r.TPR),
+                 textcoords='offset points', xytext=(5,-10), fontsize=7, color='navy')
+plt.xlabel('False Positive Rate (FPR)')
+plt.ylabel('True Positive Rate (TPR)')
+plt.title('Part A — Anomaly Detection ROC Curve\n(1-NN, Normal Profile, Euclidean Distance)')
+plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout()
+plt.savefig('part_A_ROC.png', dpi=150); plt.show()
+
+--- A(5): Calculate AUC ---
+
+auc_A = auc(fpr_A_plot, tpr_A_plot)
+print(f"AUC (Area Under Curve - Anomaly Detection) = {auc_A:.4f}")
+
+--- A(6): Find best control threshold using Youden's J ---
+
+thresh_df['Youden_J'] = thresh_df['TPR'] - thresh_df['FPR']
+best_row = thresh_df.loc[thresh_df['Youden_J'].idxmax()]
+
+print("Best threshold selected using Youden's J statistic  (J = TPR - FPR):")
+print(f"  Threshold = {best_row.Threshold:.4f}")
+print(f"  TPR       = {best_row.TPR:.4f}")
+print(f"  FPR       = {best_row.FPR:.4f}")
+print(f"  J score   = {best_row.Youden_J:.4f}")
+
+plt.figure(figsize=(7,6))
+plt.plot(fpr_A_plot, tpr_A_plot, 'b-o', markersize=5, label=f'AUC = {auc_A:.4f}')
+plt.plot([0,1],[0,1],'k--', alpha=0.5)
+plt.scatter([best_row.FPR], [best_row.TPR], color='red', s=120, zorder=5,
+            label=f'Best theta={best_row.Threshold:.4f}  (J={best_row.Youden_J:.4f})')
+plt.xlabel('FPR'); plt.ylabel('TPR')
+plt.title('Part A — ROC with Best Threshold Highlighted')
+plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout(); plt.show()
+
+================================================================================
+PART B: MISUSE DETECTION
+================================================================================
+
+--- B(1): Normalize full training set ---
+
+X_train_all_raw = train_df[NUMERIC_COLS].values
+y_train_binary  = (train_df['label'] != 'normal').astype(int).values
+
+scaler_B  = MinMaxScaler()
+X_train_B = scaler_B.fit_transform(X_train_all_raw)
+X_test_B  = scaler_B.transform(X_test_raw)
+print(f"Training instances (all): {len(X_train_B):,}")
+print(f"  Normal:  {(y_train_binary == 0).sum():,}")
+print(f"  Attack:  {(y_train_binary == 1).sum():,}")
+print(f"Test instances: {len(X_test_B):,}")
+
+--- B(2): k-NN binary classification for k = 1,3,5,...,19 ---
+
+k_values  = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
+knn_preds = {}
+
+for k in k_values:
+    knn = KNeighborsClassifier(n_neighbors=k, metric='euclidean', n_jobs=-1)
+    knn.fit(X_train_B, y_train_binary)
+    knn_preds[k] = knn.predict(X_test_B)
+    print(f"k={k:2d} — predicted {knn_preds[k].sum()} attacks out of {len(knn_preds[k])} instances")
+
+--- B(3a): Calculate FPR and TPR for each k ---
+
+fprs_B = []
+tprs_B = []
+for k in k_values:
+    preds = knn_preds[k]
+    cm = confusion_matrix(y_test_binary, preds, labels=[0, 1])
+    TN, FP, FN, TP = cm.ravel()
+    fpr = FP / (FP + TN) if (FP + TN) > 0 else 0
+    tpr = TP / (TP + FN) if (TP + FN) > 0 else 0
+    fprs_B.append(fpr)
+    tprs_B.append(tpr)
+
+--- B(3b): Plot ROC curve ---
+
+sorted_B      = sorted(zip(fprs_B, tprs_B))
+fprs_B_sorted = [p[0] for p in sorted_B]
+tprs_B_sorted = [p[1] for p in sorted_B]
+
+fprs_B_plot = [0.0] + fprs_B_sorted + [1.0]
+tprs_B_plot = [0.0] + tprs_B_sorted + [1.0]
+
+plt.figure(figsize=(7, 5))
+plt.plot(fprs_B_plot, tprs_B_plot, 'rs-', label='Misuse Detection ROC')
+plt.plot([0, 1], [0, 1], 'k--', label='Random Classifier')
+for k, fpr, tpr in zip(k_values, fprs_B, tprs_B):
+    plt.annotate(f'k={k}', (fpr, tpr), textcoords='offset points', xytext=(5, 5), fontsize=8)
+plt.xlabel('False Positive Rate (FPR)')
+plt.ylabel('True Positive Rate (TPR)')
+plt.title('Part B — ROC Curve (Misuse Detection, varying k)')
+plt.legend(); plt.grid(True); plt.tight_layout()
+plt.savefig('part_B_ROC.png', dpi=150); plt.show()
+
+print("\nk   | FPR    | TPR")
+print('-' * 30)
+for k, fpr, tpr in zip(k_values, fprs_B, tprs_B):
+    print(f"k={k:2d} | {fpr:.4f} | {tpr:.4f}")
+
+--- B(4): Calculate AUC ---
+
+auc_B = auc(fprs_B_plot, tprs_B_plot)
+print(f"AUC (Part B - Misuse Detection): {auc_B:.4f}")
+
+--- B(5): 5-class confusion matrix using k=1 ---
+
+y_train_cat = train_df['label'].apply(map_attack).values
+y_test_cat  = test_df['label'].apply(map_attack).values
+
+knn1 = KNeighborsClassifier(n_neighbors=1, metric='euclidean', n_jobs=-1)
+knn1.fit(X_train_B, y_train_cat)
+y_pred_cat = knn1.predict(X_test_B)
+
+cm_5  = confusion_matrix(y_test_cat, y_pred_cat, labels=CATEGORIES)
+cm_df = pd.DataFrame(cm_5, index=CATEGORIES, columns=CATEGORIES)
+cm_df.index.name   = 'True Label'
+cm_df.columns.name = 'Predicted Label'
+
+print("Confusion Matrix (k=1, 5-class):")
+display(cm_df)
+
+fig, ax = plt.subplots(figsize=(7, 5))
+im = ax.imshow(cm_5, cmap='Blues')
+plt.colorbar(im, ax=ax)
+ax.set_xticks(range(len(CATEGORIES))); ax.set_yticks(range(len(CATEGORIES)))
+ax.set_xticklabels(CATEGORIES); ax.set_yticklabels(CATEGORIES)
+ax.set_xlabel('Predicted Label'); ax.set_ylabel('True Label')
+ax.set_title('Confusion Matrix — k=1 (5 classes)')
+for i in range(len(CATEGORIES)):
+    for j in range(len(CATEGORIES)):
+        ax.text(j, i, str(cm_5[i, j]), ha='center', va='center', color='black', fontsize=9)
+plt.tight_layout()
+plt.savefig('part_B_confusion_matrix.png', dpi=150); plt.show()
+
+--- B(6): KDD'99 cost score ---
+
+total_cost = 0
+num_valid  = 0
+
+for true_label, pred_label in zip(y_test_cat, y_pred_cat):
+    true_idx = cat_to_idx.get(true_label, -1)
+    pred_idx = cat_to_idx.get(pred_label, -1)
+    if true_idx == -1 or pred_idx == -1:
+        continue
+    total_cost += COST_MATRIX[true_idx][pred_idx]
+    num_valid  += 1
+
+avg_cost = total_cost / num_valid
+
+print(f"Total instances evaluated:  {num_valid:,}")
+print(f"Total cost:                 {total_cost:,}")
+print(f"Average cost per instance:  {avg_cost:.4f}")
+print()
+print("Reference scores:")
+print("  KDD'99 contest winner: ~0.1906")
+print("  Random classifier:     ~2.0")
+print(f"  Our k=1 k-NN score:    {avg_cost:.4f}")
+
+================================================================================
+END OF CODE
+================================================================================
